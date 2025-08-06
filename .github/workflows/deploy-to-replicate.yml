@@ -1,0 +1,25 @@
+# .github/workflows/deploy-to-replicate.yml
+
+name: Deploy to Replicate 🚀
+
+# This action runs automatically whenever you push code to your `main` branch.
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Get the code from your repository
+      - uses: actions/checkout@v4
+
+      # Step 2: Install and set up the `cog` command-line tool
+      - uses: replicate/setup-cog@v1
+        with:
+          # This uses the secret you created in Step 1 to log in
+          token: ${{ secrets.REPLICATE_API_TOKEN }}
+
+      # Step 3: Push the model to Replicate
+      - name: Push to Replicate
+        run: cog push r8.im/jfirma1/amber-character-updated
