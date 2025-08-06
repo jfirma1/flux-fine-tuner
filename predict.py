@@ -65,6 +65,7 @@ logging.getLogger("transformers").setLevel(logging.CRITICAL)
 class LoadedLoRAs:
     main: str | None
     extra: str | None
+    extra_b: str | None  # ADDED
 
 
 class Predictor(BasePredictor):
@@ -187,8 +188,8 @@ class Predictor(BasePredictor):
         }
 
         self.loaded_lora_urls = {
-            "dev": LoadedLoRAs(main=None, extra=None),
-            "schnell": LoadedLoRAs(main=None, extra=None),
+            "dev": LoadedLoRAs(main=None, extra=None, extra_b=None),    # MODIFIED
+            "schnell": LoadedLoRAs(main=None, extra=None, extra_b=None), # MODIFIED
         }
         print("setup took: ", time.time() - start)
 
@@ -267,6 +268,17 @@ class Predictor(BasePredictor):
         ),
         extra_lora_scale: float = Input(
             description="Determines how strongly the extra LoRA should be applied.",
+            default=1.0,
+            le=2.0,
+            ge=-1.0,
+        ),
+        # ADDED extra_lora_b and extra_lora_b_scale inputs
+        extra_lora_b: str = Input(
+            description="Combine this fine-tune with a third LoRA.",
+            default=None,
+        ),
+        extra_lora_b_scale: float = Input(
+            description="Determines how strongly the third LoRA should be applied.",
             default=1.0,
             le=2.0,
             ge=-1.0,
@@ -357,8 +369,9 @@ class Predictor(BasePredictor):
             flux_kwargs["width"] = width
             flux_kwargs["height"] = height
 
-        if replicate_weights:
-            flux_kwargs["joint_attention_kwargs"] = {"scale": lora_scale}
+        # This `joint_attention_kwargs` block is being replaced by the more specific logic below
+        # if replicate_weights:
+        #     flux_kwargs["joint_attention_kwargs"] = {"scale": lora_scale}
 
         assert model in ["dev", "schnell"]
         if model == "dev":
@@ -369,23 +382,30 @@ class Predictor(BasePredictor):
             max_sequence_length = 256
             guidance_scale = 0
 
+        # MODIFIED LoRA loading and fusing logic to handle three LoRAs
         if replicate_weights:
             start_time = time.time()
-            if extra_lora:
-                flux_kwargs["joint_attention_kwargs"] = {"scale": 1.0}
-                print(f"Loading extra LoRA weights from: {extra_lora}")
+            if extra_lora_b:
+                print(f"Loading three LoRAs: main, extra, and extra_b")
+                self.load_three_loras(replicate_weights, extra_lora, extra_lora_b, model)
+                pipe.set_adapters(
+                    ["main", "extra", "extra_b"],
+                    adapter_weights=[lora_scale, extra_lora_scale, extra_lora_b_scale],
+                )
+            elif extra_lora:
+                print(f"Loading two LoRAs: main and extra")
                 self.load_multiple_loras(replicate_weights, extra_lora, model)
                 pipe.set_adapters(
                     ["main", "extra"], adapter_weights=[lora_scale, extra_lora_scale]
                 )
             else:
-                flux_kwargs["joint_attention_kwargs"] = {"scale": lora_scale}
+                print(f"Loading a single LoRA")
                 self.load_single_lora(replicate_weights, model)
                 pipe.set_adapters(["main"], adapter_weights=[lora_scale])
             print(f"Loaded LoRAs in {time.time() - start_time:.2f}s")
         else:
             pipe.unload_lora_weights()
-            self.loaded_lora_urls[model] = LoadedLoRAs(main=None, extra=None)
+            self.loaded_lora_urls[model] = LoadedLoRAs(main=None, extra=None, extra_b=None)
 
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
@@ -431,7 +451,7 @@ class Predictor(BasePredictor):
 
     def load_single_lora(self, lora_url: str, model: str):
         # If no change, skip
-        if lora_url == self.loaded_lora_urls[model].main:
+        if lora_url == self.loaded_lora_urls[model].main and not self.loaded_lora_urls[model].extra:
             print("Weights already loaded")
             return
 
@@ -439,7 +459,7 @@ class Predictor(BasePredictor):
         pipe.unload_lora_weights()
         lora_path = self.weights_cache.ensure(lora_url)
         pipe.load_lora_weights(lora_path, adapter_name="main")
-        self.loaded_lora_urls[model] = LoadedLoRAs(main=lora_url, extra=None)
+        self.loaded_lora_urls[model] = LoadedLoRAs(main=lora_url, extra=None, extra_b=None)
         pipe = pipe.to("cuda")
 
     def load_multiple_loras(self, main_lora_url: str, extra_lora_url: str, model: str):
@@ -449,12 +469,12 @@ class Predictor(BasePredictor):
         # If no change, skip
         if (
             main_lora_url == loaded_lora_urls.main
-            and extra_lora_url == self.loaded_lora_urls[model].extra
+            and extra_lora_url == loaded_lora_urls.extra
+            and not loaded_lora_urls.extra_b
         ):
             print("Weights already loaded")
             return
 
-        # We always need to load both?
         pipe.unload_lora_weights()
 
         main_lora_path = self.weights_cache.ensure(main_lora_url)
@@ -464,7 +484,39 @@ class Predictor(BasePredictor):
         pipe.load_lora_weights(extra_lora_path, adapter_name="extra")
 
         self.loaded_lora_urls[model] = LoadedLoRAs(
-            main=main_lora_url, extra=extra_lora_url
+            main=main_lora_url, extra=extra_lora_url, extra_b=None
+        )
+        pipe = pipe.to("cuda")
+
+    # ADDED function to handle loading three LoRAs
+    def load_three_loras(
+        self, main_lora_url: str, extra_lora_url: str, extra_lora_b_url: str, model: str
+    ):
+        pipe = self.pipes[model]
+        loaded_lora_urls = self.loaded_lora_urls[model]
+
+        # If no change, skip
+        if (
+            main_lora_url == loaded_lora_urls.main
+            and extra_lora_url == loaded_lora_urls.extra
+            and extra_lora_b_url == loaded_lora_urls.extra_b
+        ):
+            print("Weights already loaded")
+            return
+
+        pipe.unload_lora_weights()
+
+        main_lora_path = self.weights_cache.ensure(main_lora_url)
+        pipe.load_lora_weights(main_lora_path, adapter_name="main")
+
+        extra_lora_path = self.weights_cache.ensure(extra_lora_url)
+        pipe.load_lora_weights(extra_lora_path, adapter_name="extra")
+
+        extra_lora_b_path = self.weights_cache.ensure(extra_lora_b_url)
+        pipe.load_lora_weights(extra_lora_b_path, adapter_name="extra_b")
+
+        self.loaded_lora_urls[model] = LoadedLoRAs(
+            main=main_lora_url, extra=extra_lora_url, extra_b=extra_lora_b_url
         )
         pipe = pipe.to("cuda")
 
