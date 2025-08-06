@@ -22,4 +22,4 @@ jobs:
 
       # Step 3: Push the model to Replicate
       - name: Push to Replicate
-        run: cog push r8.im/jfirma1/amber-character-updated
+        run: cog push r8.im/jfirma1/amber-character
